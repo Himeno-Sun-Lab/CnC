@@ -3,11 +3,27 @@ import json
 import numpy as np
 from default_params.ctx_params import ctx_params
 
+RESET = "\033[0m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+
+NOTICE = YELLOW
+FCOLOR = {
+    "E": "\033[34m",
+    "I": "\033[31m"
+    }
+BCOLOR = {
+    "E": "\033[44m",
+    "I": "\033[41m"
+    }
+
 class Column:
     def __init__(self):
         pass
 
-    def __init__(self, col_label, col_params, col_conn):
+    def __init__(self, col_label, col_params):
         """
         Initialise a column.
 
@@ -15,26 +31,31 @@ class Column:
             col_label (str): Label (or name) of column
             col_params (dict): Column params
             col_conn (str): File name of internal column connections
+        
         Returns:
             None
         """
+        self.A_scaling = 0.1
         self.col_label = col_label
         self.col_params = col_params.copy()
         self.size = col_params["structure_info"]["region_size"]
-        self.connections = col_conn
+        self.connections = col_params["connection_info"]["internal"]
+        self.psg = col_params["connection_info"]["poisson"]
         # self.create_column(self.col_params["structure_info"]["region_name"])
 
     def create_neuron(self, pop_name, pop_params):
         """
         Create neuron model.
+        ---
 
         Args:
             pop_name (str): Population name
             pop_params (dict): Population params
         
         Returns:
-            pop_density (float): Neuron density of population
-            pop_class (str): Class of population
+            Tuple(float, str):
+                - float: Neuron density of population
+                - str: Class of population
         """
         params = pop_params.copy()
         neuron_model = params.pop("model")
@@ -42,8 +63,9 @@ class Column:
         pop_density = params.pop("Cellcount_mm2")
         if "cond" in neuron_model:
             pop_params["g_L"] = 250. / params.pop("tau_m")
-        nest.CopyModel(neuron_model, pop_name, params)
-        # print(f"({self.col_label}){pop_name}")
+        if not pop_name in nest.node_models:
+            nest.CopyModel(neuron_model, pop_name, params)
+            # print(f"({self.col_label}){pop_name}")
         return pop_density, pop_class
 
     def estimate_population(self, density, h_layer):
@@ -76,7 +98,7 @@ class Column:
         # self.pops = {"E": {}, "I": {}}
         self.pops = {}
         self.pop_flags = {}
-        print(f"Creating Column {self.col_label}")
+        print(f"\033[32mCreating Column {self.col_label}\033[0m")
         layerthickness = self.col_params["structure_info"]["layer_thickness"]
         layers = self.col_params["structure_info"]["Layer_Name"]
         for layer_name, layer_params in self.col_params["neuro_info"].items():
@@ -93,26 +115,31 @@ class Column:
                 self.pops[pop_name] = population
                 self.pop_flags[pop_name] = flag
         return self.pops
-    
-    def create_connections(self):
+
+    def create_connections(self, col_conn=None, verbose=False):
         """
-        Create connections in a column.
+        Create internal connections in a column.
 
         Args:
-            conn_dict (dict): Connections read from connection file
+            col_conn (str): Path to connection file
         
         Returns:
             None
         """
-        with open(self.connections, 'r') as f:
+
+        if col_conn == None:
+            col_conn = self.connections
+        with open(col_conn, 'r') as f:
             connections = json.load(f)
         conn = connections.copy()
         for pre_pop in conn.keys():
             for post_pop, conn_params in conn[pre_pop].items():
-                print(f"{pre_pop} --< {post_pop}")
                 self.connect_layers_ctx(pre_pop, post_pop, conn_params)
-                # Nsyn = self.connect_layers_ctx(pre_pop, post_pop, conn_params)
-                # print(f"{Nsyn} synapses")
+                if verbose:
+                    print(f"(Col {self.col_label}) {BCOLOR[self.pop_flags[pre_pop]]}{pre_pop:^13}{RESET} ---< {BCOLOR[self.pop_flags[post_pop]]}{post_pop:^13}{RESET}")
+                    # SN = len(nest.GetConnections(self.pops[pre_pop], self.pops[post_pop]))
+                    # print(f"{COLOR[self.pop_flags[pre_pop]]}{pre_pop:^13}{RESET} --{SN:-^7}-< {COLOR[self.pop_flags[post_pop]]}{post_pop:^13}{RESET}")
+                    # del SN
         pass
 
     def connect_layers_ctx(self, pre, post, conn):
@@ -126,11 +153,9 @@ class Column:
         
         Returns:
             None
-            # SN (int): Synapse number between specified populations.
         """
         sigma_x = conn['sigma']/1000.
         sigma_y = conn['sigma']/1000.
-        #print (conn_params)
         if conn['p_center'] != 0.0 and sigma_x != 0.0 and conn['weight'] != 0.0:
             weight_distribution=conn['weight_distribution']
             if weight_distribution == 'lognormal':
@@ -154,5 +179,58 @@ class Column:
             pre = self.pops[pre]
             post = self.pops[post]
             nest.Connect(pre, post, conn_dict, syn_spec)
-            # SN = len(nest.GetConnections(pre, post))
-            # return SN
+
+    def add_detectors(self, verbose=False):
+        """
+        Add and connect detectors for each layers.
+
+        Args:
+            verbose (bool): To execute this in verbose mode or not
+        
+        Returns:
+            dict: All detectors in the column
+        """
+        self.detectors = {}
+        for pop_name, pop in self.pops.items():
+            detector = nest.Create("spike_recorder", params={"record_to": "ascii"})
+            nest.Connect(pop, detector)
+            self.detectors[pop_name] = detector
+            if verbose:
+                print(f"{NOTICE}Add detecor for {FCOLOR[self.pop_flags[pop_name]]}{pop_name}{RESET}")
+        print(f"{NOTICE}Add detectors for column {self.col_label}{RESET}")
+        return self.detectors
+    
+    def add_posissons(self, verbose=False):
+        """
+        Add and connect poisson noise generators for a column.
+
+        Args:
+            verbose (bool): To execute this in verbose mode or not
+
+        Returns:
+            None
+        """
+        psgs = self.col_params["connection_info"]["poisson"]
+        for pop_name, pop in self.pops.items():
+            psg_dict = {"rate": psgs[pop_name]["PSG"]["rate"], "start": 500. + psgs[pop_name]["PSG"]["offset"]}
+               
+            psg = nest.Create("poisson_generator", params=psg_dict)
+            nest.Connect(psg, pop, syn_spec=psgs[pop_name]["SYNP"])
+            if verbose:
+                print(f"Add Poisson's noise for {FCOLOR[self.pop_flags[pop_name]]}{pop_name}{RESET}")
+        print(f"{NOTICE}Add Poisson's noise for column {self.col_label}{RESET}")
+        pass
+
+    def update_weight(self, pre, post, new_conn):
+        """
+        Update synapse connection weight.
+
+        Args:
+            pre (pop):
+            post (pop):
+            new_conn (dict):
+
+        Returns:
+            None
+        """
+        pass
